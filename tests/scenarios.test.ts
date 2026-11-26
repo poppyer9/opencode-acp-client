@@ -752,34 +752,64 @@ async function sseDuring(url: string, run: () => Promise<unknown>): Promise<stri
 }
 
 describe('an agent that reports usage only in the prompt result', () => {
-  it('still feeds the sidebar/footer, which read tokens off the step', async () => {
+  it('feeds per-turn tokens on session.step.ended and accumulates cumulative totals on session.usage.updated and GET /api/session/:id', async () => {
     // opencode's `PromptResponse.usage` is where it reports tokens; it never sends a
-    // `usage_update`. Ignoring the result left the context meter and footer empty.
+    // `usage_update`. Ignoring the result left the context meter and footer empty,
+    // and emitting single-turn tokens on `session.usage.updated` overwrote session totals.
     const url = await start('rich-turn', { FAKE_ACP_USAGE: '1', FAKE_ACP_REPLY: 'usage-ok' });
     const session = await createSession(url);
-    const stream = await sseDuring(url, () => runTurn(url, session));
-    const events = stream
+    const stream1 = await sseDuring(url, () => runTurn(url, session));
+    const events1 = stream1
       .split('\n')
       .filter((line) => line.startsWith('data: '))
       .map((line) => JSON.parse(line.slice(6)) as { type: string; data: Record<string, unknown> });
 
-    const usage = events.find((event) => event.type === 'session.usage.updated')!;
-    expect(usage['data']['tokens']).toMatchObject({
+    const usage1 = events1.find((event) => event.type === 'session.usage.updated')!;
+    expect(usage1['data']['tokens']).toMatchObject({
       input: 1234,
       output: 56,
       reasoning: 7,
       cache: { read: 890, write: 12 },
     });
-    const step = events.find((event) => event.type === 'session.step.ended')!;
-    expect(step['data']['tokens']).toMatchObject({ input: 1234, output: 56 });
+    const step1 = events1.find((event) => event.type === 'session.step.ended')!;
+    expect(step1['data']['tokens']).toMatchObject({ input: 1234, output: 56, cache: { read: 890, write: 12 } });
+
+    // Second turn: step.ended stays per-turn while session.usage.updated and GET /api/session/:id accumulate.
+    const stream2 = await sseDuring(url, () => runTurn(url, session));
+    const events2 = stream2
+      .split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => JSON.parse(line.slice(6)) as { type: string; data: Record<string, unknown> });
+
+    const step2 = events2.find((event) => event.type === 'session.step.ended')!;
+    expect(step2['data']['tokens']).toMatchObject({ input: 1234, output: 56, cache: { read: 890, write: 12 } });
+    const usage2 = events2.find((event) => event.type === 'session.usage.updated')!;
+    expect(usage2['data']['tokens']).toMatchObject({
+      input: 2468,
+      output: 112,
+      reasoning: 14,
+      cache: { read: 1780, write: 24 },
+    });
+    const fetched = (await (await fetch(`${url}/api/session/${session}`)).json()) as {
+      data?: { tokens?: Record<string, unknown> };
+    };
+    expect(fetched.data?.tokens).toEqual({
+      input: 2468,
+      output: 112,
+      reasoning: 14,
+      cache: { read: 1780, write: 24 },
+    });
   });
 });
 
 describe('an agent that reports a whole-turn aggregate as usage', () => {
-  it('does not present it as the current context', async () => {
-    // opencode's ACP adapter sends input+output+reasoning+cache for the entire
-    // agentic turn; a 1M model can show 3M (304%) in the TUI's context meter.
-    // The bridge must not treat that aggregate as context.
+  it('preserves PromptResponse.usage even when total exceeds the context window (no separate bridge ledger)', async () => {
+    // Rather than maintaining a separate bridge usage ledger, we pass the full
+    // `PromptResponse.usage` through on `session.step.ended` and accumulate it into
+    // `session.usage.updated` / `GET /api/session/:id` so TUI plugins (e.g. CacheHit
+    // and Timeline) do not lose multi-step turns over the context limit. The explicit
+    // tradeoff is that the built-in context meter may temporarily show >100% until
+    // the next smaller turn settles.
     const url = await start('rich-turn', { FAKE_ACP_USAGE_AGGREGATE: '1', FAKE_ACP_REPLY: 'aggregate-ok' });
     const session = await createSession(url);
     const stream = await sseDuring(url, () => runTurn(url, session));
@@ -788,26 +818,10 @@ describe('an agent that reports a whole-turn aggregate as usage', () => {
       .filter((line) => line.startsWith('data: '))
       .map((line) => JSON.parse(line.slice(6)) as { type: string; data: Record<string, unknown> });
 
-    const total = (tokens: unknown): number => {
-      const value = tokens as {
-        input?: number;
-        output?: number;
-        reasoning?: number;
-        cache?: { read?: number; write?: number };
-      };
-      return (
-        (value.input ?? 0) +
-        (value.output ?? 0) +
-        (value.reasoning ?? 0) +
-        (value.cache?.read ?? 0) +
-        (value.cache?.write ?? 0)
-      );
-    };
-    for (const event of events.filter((event) => event.type === 'session.usage.updated')) {
-      expect(total(event.data['tokens'])).toBeLessThanOrEqual(1_000_000);
-    }
-    const step = events.find((event) => event.type === 'session.step.ended');
-    if (step?.data['tokens']) expect(total(step.data['tokens'])).toBeLessThanOrEqual(1_000_000);
+    const usage = events.filter((event) => event.type === 'session.usage.updated').at(-1)!;
+    expect(usage.data['tokens']).toMatchObject({ input: 3_000_000 });
+    const step = events.find((event) => event.type === 'session.step.ended')!;
+    expect(step.data['tokens']).toMatchObject({ input: 3_000_000 });
   });
 });
 

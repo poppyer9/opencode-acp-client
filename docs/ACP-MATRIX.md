@@ -197,6 +197,16 @@ no capability is claimed, and the field is optional — an agent that stops send
 loses the meter, not the session. It is recorded here rather than treated as a
 stable-protocol guarantee.
 
+**Deliberate tradeoff (no bridge usage ledger):** `PromptResponse.usage` is forwarded
+unfiltered on `session.step.ended` (per-turn) and accumulated into `record.session.tokens`
+on `session.usage.updated` / `GET /api/session/:id`, even when a multi-step agentic turn's
+sum exceeds the model's context window `size`. Because the bridge deliberately keeps no
+separate persistent usage ledger (`sessions.json` only), dropping `total > size` turns
+would silently erase the heaviest turns from TUI usage plugins (such as `opencode-cache-hit`
+and its Timeline logs). The explicit tradeoff is that the TUI's built-in sidebar context
+meter (which reads `session.step.ended.tokens`) may temporarily show `>100%` after a heavy
+multi-step turn until the next smaller turn settles.
+
 ## 5. What you lose when an agent lacks something
 
 | Agent lacks | What still works | What does not |

@@ -716,3 +716,94 @@ describe('non-turn session updates do not start a turn', () => {
     }
   });
 });
+
+describe('prompt usage accounting', () => {
+  it('preserves PromptResponse.usage on session.step.ended even when total exceeds the context window size', () => {
+    const { translator, record, events } = harness();
+    translator.beginTurn(record);
+    translator.apply(record, { sessionUpdate: 'usage_update', used: 180_000, size: 1_048_576 });
+    translator.recordPromptUsage(record, {
+      inputTokens: 120_000,
+      outputTokens: 5_601,
+      thoughtTokens: 0,
+      cachedReadTokens: 1_700_000,
+      cachedWriteTokens: 0,
+      totalTokens: 1_825_601,
+    });
+    translator.endTurn(record);
+
+    const step = events.find((e) => e.type === 'session.step.ended');
+    expect((step?.data as { tokens?: unknown })?.tokens).toEqual({
+      input: 120_000,
+      output: 5_601,
+      reasoning: 0,
+      cache: { read: 1_700_000, write: 0 },
+    });
+  });
+
+  it('accumulates session.tokens across turns on session.usage.updated without letting mid-turn usage_update wipe cache reads', () => {
+    const { translator, record, events } = harness();
+
+    // Turn 1: 4M cached read
+    translator.beginTurn(record);
+    translator.recordPromptUsage(record, {
+      inputTokens: 100_000,
+      outputTokens: 500,
+      thoughtTokens: 10,
+      cachedReadTokens: 4_000_000,
+      cachedWriteTokens: 1_000,
+    });
+    translator.endTurn(record);
+
+    // Turn 2: mid-turn usage_update arrives first, then a smaller 1.7M cached read
+    translator.beginTurn(record);
+    translator.apply(record, {
+      sessionUpdate: 'usage_update',
+      used: 180_000,
+      size: 1_048_576,
+      cost: { amount: 0.25, currency: 'USD' },
+    });
+    const midTurnUsage = events.filter((e) => e.type === 'session.usage.updated').at(-1);
+    expect((midTurnUsage?.data as { tokens?: unknown; cost?: number })).toEqual({
+      sessionID: record.session.id,
+      cost: 0.25,
+      tokens: {
+        input: 100_000,
+        output: 500,
+        reasoning: 10,
+        cache: { read: 4_000_000, write: 1_000 },
+      },
+    });
+
+    translator.recordPromptUsage(record, {
+      inputTokens: 50_000,
+      outputTokens: 200,
+      thoughtTokens: 5,
+      cachedReadTokens: 1_700_000,
+      cachedWriteTokens: 500,
+    });
+    translator.endTurn(record);
+
+    // Per-turn step.ended carries each turn's own tokens (4M on turn 1, 1.7M on turn 2).
+    const steps = events.filter((e) => e.type === 'session.step.ended');
+    expect(steps).toHaveLength(2);
+    expect((steps[0]?.data as { tokens?: { cache?: { read?: number } } })?.tokens?.cache?.read).toBe(4_000_000);
+    expect((steps[1]?.data as { tokens?: { cache?: { read?: number } } })?.tokens?.cache?.read).toBe(1_700_000);
+
+    // Cumulative session totals on session.usage.updated and record.session.tokens sum both turns (5.7M).
+    const finalUsage = events.filter((e) => e.type === 'session.usage.updated').at(-1);
+    const expectedCumulative = {
+      input: 150_000,
+      output: 700,
+      reasoning: 15,
+      cache: { read: 5_700_000, write: 1_500 },
+    };
+    expect((finalUsage?.data as { tokens?: unknown; cost?: number })).toEqual({
+      sessionID: record.session.id,
+      cost: 0.25,
+      tokens: expectedCumulative,
+    });
+    expect(record.session.tokens).toEqual(expectedCumulative);
+    expect(record.session.cost).toBe(0.25);
+  });
+});

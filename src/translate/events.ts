@@ -58,6 +58,8 @@ export class AcpTranslator {
   private readonly lastContextSize = new Map<string, number>();
   /** Cumulative session cost, USD only (see applyUsage). */
   private readonly lastCost = new Map<string, number>();
+  /** Sessions that have reported per-turn `PromptResponse.usage` (cumulative in `record.session.tokens`). */
+  private readonly hasPromptUsage = new Set<string>();
   /** toolCallId → part id, so updates target the same card. */
   private toolNames = new Map<string, string>();
   private toolInputs = new Map<string, unknown>();
@@ -600,13 +602,33 @@ export class AcpTranslator {
       }
     }
     this.lastCost.set(record.session.id, cost);
-    // Remembered so `session.step.ended` can carry the same numbers: the
-    // sidebar's context meter reads them off the assistant row, not off
-    // `session.usage.updated`.
+    record.session.cost = cost;
+    // Remembered so `session.step.ended` can carry the same numbers when the agent
+    // does not report `PromptResponse.usage`: the sidebar's context meter reads them
+    // off the assistant row, not off `session.usage.updated`.
     this.lastTokens.set(record.session.id, tokens);
+    // Once a session has accumulated real per-turn `PromptResponse.usage`, keep those
+    // cumulative totals on `session.usage.updated` instead of letting a mid-turn
+    // context snapshot (`used`, with `output`/`cache` zeroed) wipe `session.tokens`.
+    const sessionTokens = this.hasPromptUsage.has(record.session.id)
+      ? {
+          input: record.session.tokens.input,
+          output: record.session.tokens.output,
+          reasoning: record.session.tokens.reasoning,
+          cache: { read: record.session.tokens.cache.read, write: record.session.tokens.cache.write },
+        }
+      : tokens;
+    if (!this.hasPromptUsage.has(record.session.id)) {
+      record.session.tokens = {
+        input: tokens.input,
+        output: tokens.output,
+        reasoning: tokens.reasoning,
+        cache: { read: tokens.cache.read, write: tokens.cache.write },
+      };
+    }
     this.sink.emit({
       type: EVENT.sessionUsageUpdated,
-      data: { sessionID: record.session.id, cost, tokens },
+      data: { sessionID: record.session.id, cost, tokens: sessionTokens },
       location: this.location,
     });
   }
@@ -641,22 +663,47 @@ export class AcpTranslator {
       reasoning: number(raw.thoughtTokens),
       cache: { read: number(raw.cachedReadTokens), write: number((raw as { cachedWriteTokens?: unknown }).cachedWriteTokens) },
     };
-    if (tokens.input === 0 && tokens.output === 0 && tokens.reasoning === 0) return;
-    // Same guard as usage_update: opencode can put a whole turn's processed
-    // tokens in the prompt result. That is not the current context; do not let it
-    // overwrite the last plausible row.
-    const size = this.lastContextSize.get(record.session.id);
-    const total = tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write;
-    if (size !== undefined && total > size) {
-      this.log(
-        `[bridge] prompt usage total=${total} exceeds size=${size}; not a context count, keeping the previous usage`,
-      );
+    if (
+      tokens.input === 0 &&
+      tokens.output === 0 &&
+      tokens.reasoning === 0 &&
+      tokens.cache.read === 0 &&
+      tokens.cache.write === 0
+    ) {
       return;
     }
+    // Deliberate tradeoff (no separate bridge usage ledger): keep the agent's full
+    // per-turn `PromptResponse.usage` on `session.step.ended` even when a multi-step
+    // agentic turn's total exceeds the context window `size`. Dropping `total > size`
+    // silently lost the heaviest turns from TUI usage plugins (e.g. CacheHit / Timeline);
+    // the explicit tradeoff is that the built-in sidebar context meter may temporarily
+    // show >100% until the next smaller turn settles.
     this.lastTokens.set(record.session.id, tokens);
+    this.hasPromptUsage.add(record.session.id);
+    // `session.usage.updated` carries the cumulative session aggregate (which TUI plugins
+    // like CacheHit read via `session.get()`), while `session.step.ended` carries this turn.
+    const nextSessionTokens = {
+      input: record.session.tokens.input + tokens.input,
+      output: record.session.tokens.output + tokens.output,
+      reasoning: record.session.tokens.reasoning + tokens.reasoning,
+      cache: {
+        read: record.session.tokens.cache.read + tokens.cache.read,
+        write: record.session.tokens.cache.write + tokens.cache.write,
+      },
+    };
+    record.session.tokens = nextSessionTokens;
     this.sink.emit({
       type: EVENT.sessionUsageUpdated,
-      data: { sessionID: record.session.id, cost: 0, tokens },
+      data: {
+        sessionID: record.session.id,
+        cost: this.lastCost.get(record.session.id) ?? 0,
+        tokens: {
+          input: nextSessionTokens.input,
+          output: nextSessionTokens.output,
+          reasoning: nextSessionTokens.reasoning,
+          cache: { read: nextSessionTokens.cache.read, write: nextSessionTokens.cache.write },
+        },
+      },
       location: this.location,
     });
   }

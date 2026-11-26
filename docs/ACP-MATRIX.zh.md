@@ -173,6 +173,14 @@ opencode v2 **只发**这个 unstable 的结果字段，从不发 `usage_update`
 这是**客户端侧的兼容读取**：不向 agent 发送任何非规范字段、不宣告任何能力，字段是
 可选的——agent 不再发它时丢的只是用量表，不是会话。因此记录在这里，而不当作稳定协议保证。
 
+**明确取舍（桥不单独维护用量账本）：** `PromptResponse.usage` 会原样透传到
+`session.step.ended`（单回合），并累加进 `record.session.tokens` 通过
+`session.usage.updated` / `GET /api/session/:id` 上报——即便多步工具调用回合的总量超过
+模型上下文窗口 `size` 也不丢弃。因为桥刻意不引入额外的持久化用量账本（只写 `sessions.json`），
+若丢弃 `total > size` 会让 TUI 用量插件（如 `opencode-cache-hit` 及其 Timeline 日志）
+静默丢失最重的回合；对应的取舍是：TUI 内置侧栏的上下文占比（读 `session.step.ended.tokens`）
+在重回合结束后可能短暂显示 `>100%`，直到下一轮较小的回合完成。
+
 ## 5. agent 缺某个能力时，你会失去什么
 
 | agent 缺少 | 仍然可用 | 不再可用 |
