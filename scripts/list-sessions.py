@@ -52,6 +52,8 @@ def main() -> int:
 
     rows = []
     for visible_id, entry in data.items():
+        if visible_id.startswith("__") or not isinstance(entry, dict):
+            continue
         title = (entry.get("title") or "").strip()
         if not title and not args.all:
             continue

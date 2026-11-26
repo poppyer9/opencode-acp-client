@@ -60,6 +60,8 @@ export interface Session {
   id: string;
   directory: string;
   title?: string;
+  /** Active primary agent / ACP mode id for this session, if known. */
+  agent?: string;
   parentID?: string;
   outcome?: 'succeeded' | 'failed' | 'interrupted';
   time: { created: number; updated: number; idle?: number; viewed?: number; archived?: number };
@@ -331,12 +333,22 @@ export const EVENT = {
    */
   modelUpdated: 'model.updated',
   /**
+   * The location's agent/mode list changed (ACP `category: "mode"` options arrived or
+   * changed). Triggers `location.agent.sync` in the TUI, mirroring `model.updated`.
+   */
+  agentUpdated: 'agent.updated',
+  /**
    * The session's selected model changed — including when the *agent* changed it
    * (a rate-limit fallback, say). Payload `{sessionID, model: {providerID, modelID}, previous?}`;
    * the store writes `model` into the session info, which is what the composer
    * and the context meter read.
    */
   modelSelected: 'session.model.selected',
+  /**
+   * The session's active agent/mode changed — including via `POST /api/session/:id/agent`
+   * or an agent-pushed `config_option_update`. Payload `{sessionID, agent, previous?}`.
+   */
+  agentSelected: 'session.agent.selected',
   sessionIdle: 'session.idle',
   sessionStatus: 'session.status',
   sessionError: 'session.error',

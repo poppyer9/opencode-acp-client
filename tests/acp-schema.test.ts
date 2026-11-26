@@ -101,6 +101,7 @@ const OUR_REQUESTS: Record<string, unknown> = {
   },
   CancelNotification: { sessionId: 'ses_1' },
   SetSessionConfigOptionRequest: { sessionId: 'ses_1', configId: 'model', value: 'deepseek-flash' },
+  SetSessionModeRequest: { sessionId: 'ses_1', modeId: 'code' },
 };
 
 describe('the requests we send are legal ACP v1', () => {
@@ -124,6 +125,7 @@ describe('the requests we send are legal ACP v1', () => {
       'session/prompt',
       'session/cancel',
       'session/set_config_option',
+      'session/set_mode',
       'session/set_model',
       'session/update',
       'session/request_permission',

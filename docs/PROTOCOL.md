@@ -196,13 +196,15 @@ The `server.connected` frame is the handshake; the client treats its absence as
 
 ### Models / agents
 
-Derived from the ACP `session/new` config options — an agent advertises models as
+Derived from the ACP `session/new` configuration — an agent advertises models as
 one option (`category: "model"`) grouped by provider, each value a JSON array
-string `["provider","model"]`, and reasoning effort as `thought_level`.
+string `["provider","model"]`, reasoning effort as `thought_level`, and modes as
+`category: "mode"` config options (or fallback ACP v1 `SessionModeState` `modes`).
 
 | Route | Response |
 |---|---|
-| `GET /api/agent` | one synthetic `primary` agent; **must not be empty** or the composer silently refuses to submit |
+| `GET /api/agent` | ACP `category: "mode"` (or `SessionModeState`) choices projected in the agent's canonical order as primary `Agent.Info` entries (inheriting the TUI's active theme colors), or one synthetic `primary` agent when the agent advertises no modes; **must not be empty** or the composer silently refuses to submit |
+| `GET /api/agent/:agentID` | single `Agent.Info` matching `id`, or 404 |
 | `GET /api/model` | `{location, data:[{id, modelID, providerID, name, capabilities, variants}]}` — `variants` is required (the client dereferences `info.variants.some`) |
 | `GET /api/provider` | `{location, data:[{id, name, models}]}` |
 
@@ -272,9 +274,12 @@ The `[bridge] unhandled route: …` log line is still the real signal.
 
 ### Write requests whose body we do not consume
 
-`POST /api/session/:id/agent` (ACP has no agent list, so it answers 204 honestly to the single
-primary agent) and the other "accepted but not implemented" session actions all answer 204, so
-the client does not treat them as a fatal protocol error.
+`POST /api/session/:id/agent` switches the session's ACP mode (via `session/set_config_option`
+for `category: "mode"` or `session/set_mode` for `SessionModeState`, persisting the choice per
+session in `SessionMap` so restored/resumed sessions keep it across restarts, and emitting
+`session.agent.selected`); when the agent advertises no modes it answers 204 honestly.
+The other "accepted but not implemented" session actions all answer 204, so the client does
+not treat them as a fatal protocol error.
 
 ## What the TUI can and cannot do through this bridge
 
@@ -336,7 +341,9 @@ honest, v2 is what renders.
 | `server.connected` | `{}` |
 | `session.created` / `session.updated` | `{session}` |
 | `session.renamed` | `{sessionID, title}` — the only title frame the TUI's store reads |
+| `model.updated` / `agent.updated` | `{}` + `location` — invalidates and re-syncs `/api/model` or `/api/agent` |
 | `session.model.selected` | `{sessionID, model:{providerID, modelID}, previous?}` — also emitted when the *agent* moves the model |
+| `session.agent.selected` | `{sessionID, agent, previous?}` — emitted on `/api/session/:id/agent` mode switch or agent-pushed mode change |
 | `session.idle` / `session.status` | `{sessionID}` / `{sessionID, status}` |
 | `session.usage.updated` | `{sessionID, cost, tokens}` |
 | `session.step.started` | `{sessionID, assistantMessageID, agent, model}` — **the only event that creates the assistant row** |

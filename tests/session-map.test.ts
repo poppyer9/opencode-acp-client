@@ -99,3 +99,26 @@ describe('recency for -c', () => {
     expect(entry.updatedAt).toBeGreaterThan(0);
   });
 });
+
+describe('sticky modes', () => {
+  it('persists per-session mode without moving updatedAt and survives metadata remember()', () => {
+    process.env['OPENCODE_ACP_CLIENT_SESSION_MAP'] = mapPath;
+    const map = new SessionMap(() => {});
+    const agy = { command: 'agy', args: ['acp'] };
+
+    map.remember('ses_mode', 'agent-mode', '/w', 'initial', agy, true);
+    const initialUpdatedAt = map.entries().find(([id]) => id === 'ses_mode')![1].updatedAt;
+
+    map.rememberMode('ses_mode', 'auto');
+    expect(map.modeFor('ses_mode')).toBe('auto');
+    expect(map.entries().find(([id]) => id === 'ses_mode')![1].updatedAt).toBe(initialUpdatedAt);
+
+    // Later metadata writes (title, directory) must preserve the saved mode.
+    map.remember('ses_mode', 'agent-mode', '/w', 'renamed', agy);
+    map.flush();
+
+    const reloaded = new SessionMap(() => {});
+    expect(reloaded.modeFor('ses_mode')).toBe('auto');
+    expect(reloaded.entries().find(([id]) => id === 'ses_mode')![1].updatedAt).toBe(initialUpdatedAt);
+  });
+});

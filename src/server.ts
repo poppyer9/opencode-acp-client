@@ -530,6 +530,9 @@ export class BridgeServer {
       };
       const createdTitle = titleFrom(body);
       const requestedId = sessionIdFrom(body);
+      const requestedAgent = typeof (body as { agent?: unknown } | undefined)?.agent === 'string'
+        ? (body as { agent: string }).agent
+        : undefined;
       // ★ Adopt the pre-created shell instead of leaving a duplicate. Without this a fresh
       // TUI conversation ended with TWO sessions (an empty one titled after the directory)
       // and TWO agent processes: the shell's, warmed for the catalog, and the new record's
@@ -564,6 +567,16 @@ export class BridgeServer {
           adopted.session.location = { ...adopted.session.location, directory };
           adopted.session.directory = directory;
           adopted.session.projectID = projectIdFor(directory);
+          if (requestedAgent) {
+            await this.applyRequestedMode(adopted, requestedAgent, {
+              emitSelected: false,
+              failOnUnsupported: false,
+            });
+          } else if (!adopted.session.agent) {
+            const initialMode =
+              this.sessionMap.modeFor(adopted.session.id) ?? this.defaultModeFor(adopted);
+            if (initialMode) adopted.session.agent = initialMode;
+          }
           // Creating a session is a deliberate tab switch, not a startup prefetch read:
           // make it the focus, so the model catalog the client asks for next is THIS
           // session's agent (the one the user launched), not whichever restored tab the
@@ -598,6 +611,16 @@ export class BridgeServer {
       }
       if (catalog?.providerID && catalog.modelID && this.isRealModel(catalog as Record<string, unknown>)) {
         record.model = { providerID: catalog.providerID, modelID: catalog.modelID };
+      }
+      if (requestedAgent) {
+        await this.applyRequestedMode(record, requestedAgent, {
+          emitSelected: false,
+          failOnUnsupported: false,
+        });
+      } else {
+        const initialMode =
+          this.sessionMap.modeFor(record.session.id) ?? this.defaultModeFor(record);
+        if (initialMode) record.session.agent = initialMode;
       }
       this.hub.emit({
         type: EVENT.sessionCreated,
@@ -873,13 +896,29 @@ export class BridgeServer {
       });
       return;
     }
-    if (path === '/api/agent') {
+    if (path === '/api/agent' && method === 'GET') {
       // The composer refuses to submit when `local.agent.current()` is empty,
       // and it does so *silently* (no toast, text stays in the box), which is
-      // indistinguishable from "the bridge is broken". ACP has no agent list,
-      // so advertise a single primary agent that mirrors the ACP session.
-      located([this.primaryAgent()]);
+      // indistinguishable from "the bridge is broken". When the ACP agent
+      // advertises `category: "mode"` config options, project each mode as an
+      // Agent.Info so `Tab` / `/agents` switches modes; otherwise advertise a
+      // single primary agent that mirrors the ACP session.
+      const focused = this.focusRecord();
+      located(this.agentCatalog(focused));
       return;
+    }
+    {
+      const agentMatch = /^\/api\/agent\/([^/]+)$/.exec(path);
+      if (agentMatch && method === 'GET') {
+        const wanted = decodeURIComponent(agentMatch[1]!);
+        const found = this.agentCatalog(this.focusRecord()).find((entry) => entry['id'] === wanted);
+        if (!found) {
+          json({ error: `agent not found: ${wanted}` }, 404);
+          return;
+        }
+        located(found);
+        return;
+      }
     }
     // ── shell (`!` mode) ──────────────────────────────────────────────────
     // The TUI creates a command here and then *polls* for its output; nothing
@@ -1457,6 +1496,8 @@ export class BridgeServer {
       const rememberedTime = resolveSessionTime(undefined, this.sessionMap.timesFor(sessionId));
       record = this.state.createSession(location, rememberedTitle ?? sessionId, sessionId, rememberedTime);
       if (rememberedTitle) this.adoptStoredTitle(record, rememberedTitle);
+      const rememberedMode = this.sessionMap.modeFor(sessionId);
+      if (rememberedMode) record.session.agent = rememberedMode;
       if (sessionDirectory) {
         record.directory = sessionDirectory;
         this.log(`[bridge] session map: ${sessionId} lives in ${sessionDirectory}`);
@@ -1603,16 +1644,20 @@ export class BridgeServer {
           );
           return;
         }
+        const activeModeBeforeMove = record.session.agent;
         const translator = this.translators.get(record.session.id);
         translator?.mute();
+        this.mutingModeUpdates.add(record.session.id);
         try {
           await agent.loadSession(record.acpSessionId, directory);
+          await this.reconcileSessionMode(record, agent, record.acpSessionId, activeModeBeforeMove);
         } catch (err) {
           const text = err instanceof Error ? err.message : String(err);
           this.log(`[bridge] /move refused by the agent: ${text}`);
           json({ _tag: 'InvalidRequestError', message: `the agent refused the move: ${text}` }, 400);
           return;
         } finally {
+          this.mutingModeUpdates.delete(record.session.id);
           translator?.unmute();
         }
       }
@@ -2136,10 +2181,20 @@ export class BridgeServer {
       );
       return;
     }
-    // `/api/session/:id/agent`. ACP exposes no agent list, so there is nothing
-    // to switch to; answering 204 keeps the client quiet instead of logging an
-    // unhandled verb. The bridge advertises exactly one primary agent.
+    // `/api/session/:id/agent` — switch the session's active ACP mode (`category: "mode"`)
+    // when the agent advertises one, or answer 204 cleanly when it exposes no mode option.
     if (rest === '/agent' && method === 'POST') {
+      const wanted = typeof (body as { agent?: unknown } | undefined)?.agent === 'string'
+        ? (body as { agent: string }).agent
+        : undefined;
+      const result = await this.applyRequestedMode(record, wanted, {
+        emitSelected: true,
+        failOnUnsupported: true,
+      });
+      if (result.status === 400) {
+        json({ _tag: 'InvalidRequestError', message: result.message }, 400);
+        return;
+      }
       noContent();
       return;
     }
@@ -3043,6 +3098,8 @@ export class BridgeServer {
           record.acpSessionId = session.sessionId;
           record.session.acpSessionId = session.sessionId;
           record.session.title = title;
+          const rememberedMode = this.sessionMap.modeFor(visibleId);
+          if (rememberedMode && !record.session.agent) record.session.agent = rememberedMode;
           this.sessionMap.rememberBoth(
             visibleId,
             session.sessionId,
@@ -3114,6 +3171,10 @@ export class BridgeServer {
     if (this.options.resumeVisibleSessionId !== undefined) {
       const remembered = this.sessionMap.titleFor(record.session.id);
       if (remembered) this.adoptStoredTitle(record, remembered);
+    }
+    if (resumeId !== undefined) {
+      const rememberedMode = this.sessionMap.modeFor(record.session.id);
+      if (rememberedMode) record.session.agent = rememberedMode;
     }
     // Not a conversation yet: `POST /api/session` adopts it (see `rekeySession`).
     if (this.options.resumeSession === undefined && this.options.resumeVisibleSessionId === undefined) {
@@ -3916,6 +3977,8 @@ export class BridgeServer {
 
   private readonly translators = new Map<string, AcpTranslator>();
   private readonly pendingAgents = new Map<string, Promise<{ agent: AcpClient; sessionId: string }>>();
+  /** Sessions currently booting or reloading where startup `config_option_update` must not emit `session.agent.selected`. */
+  private readonly mutingModeUpdates = new Set<string>();
   /** True once any agent has advertised `session/new` config options. */
   private get agentConfigReady(): boolean {
     for (const agent of this.agents.values()) {
@@ -4032,6 +4095,40 @@ export class BridgeServer {
     });
   }
 
+  private emitAgentUpdated(record: SessionRecord): void {
+    const directory = record.directory ?? this.location.directory;
+    this.hub.emit({
+      type: EVENT.agentUpdated,
+      data: {},
+      location: {
+        directory,
+        project: {
+          id: projectIdFor(directory),
+          directory,
+          canonical: directory,
+        },
+      },
+    });
+  }
+
+  private applyAgentModeUpdate(record: SessionRecord, nextMode: string | undefined): void {
+    if (!nextMode || nextMode === record.session.agent || this.mutingModeUpdates.has(record.session.id)) {
+      return;
+    }
+    const previousMode = record.session.agent;
+    record.session.agent = nextMode;
+    this.log(`[bridge] agent switched the mode -> ${nextMode}`);
+    this.hub.emit({
+      type: EVENT.agentSelected,
+      data: {
+        sessionID: record.session.id,
+        agent: nextMode,
+        ...(previousMode ? { previous: previousMode } : {}),
+      },
+      location: this.location,
+    });
+  }
+
   private applyConfigOptionUpdate(record: SessionRecord, agent: AcpClient, update: SessionUpdate): void {
     const options = Array.isArray(update['configOptions'])
       ? (update['configOptions'] as SessionConfigOption[])
@@ -4040,6 +4137,10 @@ export class BridgeServer {
       this.log('[bridge] config_option_update without a configOptions array; ignoring');
       return;
     }
+    const prevModeOpt = agent.configOptionsFor(record.acpSessionId).find(isModeOption);
+    const prevModeChoiceIds = prevModeOpt
+      ? modeChoicesOf(prevModeOpt).map((c) => c.value).join('\u0000')
+      : '';
     agent.applyConfigOptions(record.acpSessionId ?? record.session.id, options);
     if (
       options.some(
@@ -4048,6 +4149,15 @@ export class BridgeServer {
       )
     ) {
       this.emitModelUpdated(record);
+    }
+
+    const nextModeOpt = options.find(isModeOption);
+    if (nextModeOpt) {
+      const nextChoiceIds = modeChoicesOf(nextModeOpt).map((c) => c.value).join('\u0000');
+      if (nextChoiceIds && nextChoiceIds !== prevModeChoiceIds) {
+        this.emitAgentUpdated(record);
+      }
+      this.applyAgentModeUpdate(record, modeFromConfigOptions(options));
     }
 
     const model = modelFromConfigOptions(options);
@@ -4149,6 +4259,14 @@ export class BridgeServer {
         this.applyConfigOptionUpdate(record, agent, update);
         return;
       }
+      if (update.sessionUpdate === UPDATE.currentModeUpdate) {
+        const nextMode = typeof update['currentModeId'] === 'string' ? update['currentModeId'] : undefined;
+        if (nextMode) {
+          agent.applyCurrentMode(record.acpSessionId ?? sessionId, nextMode);
+          this.applyAgentModeUpdate(record, nextMode);
+        }
+        return;
+      }
       // The agent's slash commands (dsh advertises ~45, most of them skill runners).
       // Store them per session and tell the client to re-read `GET /api/command`: its
       // store has a dedicated `command.updated` case that invalidates and re-syncs
@@ -4203,6 +4321,175 @@ export class BridgeServer {
     };
   }
 
+  private liveAgentSessions(only?: SessionRecord): Array<{ record: SessionRecord; agent: AcpClient }> {
+    // One connection can host several sessions, and each session has its own catalog.
+    // Iterate SESSIONS (with their agent), not connections, or the union would only see
+    // whichever session touched its connection last.
+    if (!only) {
+      return this.state
+        .all()
+        .map((record) => ({ record, agent: this.agents.get(record.session.id) }))
+        .filter((entry): entry is { record: SessionRecord; agent: AcpClient } => entry.agent !== undefined);
+    }
+    const sameAgent = (candidate: SessionRecord): boolean =>
+      agentBindingLabel(candidate.agent ?? this.agentBinding()) ===
+      agentBindingLabel(only.agent ?? this.agentBinding());
+    const ordered: Array<{ record: SessionRecord; agent: AcpClient }> = [];
+    const onlyAgent = this.agents.get(only.session.id);
+    if (onlyAgent) ordered.push({ record: only, agent: onlyAgent });
+    for (const candidate of this.state.all()) {
+      if (candidate.session.id === only.session.id || !sameAgent(candidate)) continue;
+      const candidateAgent = this.agents.get(candidate.session.id);
+      if (candidateAgent) ordered.push({ record: candidate, agent: candidateAgent });
+    }
+    return ordered;
+  }
+
+  private modeOptionFor(only?: SessionRecord): SessionConfigOption | undefined {
+    for (const { record, agent } of this.liveAgentSessions(only)) {
+      for (const option of agent.configOptionsFor(record.acpSessionId)) {
+        if (isModeOption(option) && modeChoicesOf(option).length > 0) return option;
+      }
+    }
+    return undefined;
+  }
+
+  private async applyRequestedMode(
+    record: SessionRecord,
+    wanted: string | undefined,
+    options: { emitSelected: boolean; failOnUnsupported: boolean },
+  ): Promise<{ status: 204 } | { status: 400; message: string }> {
+    if (!wanted) {
+      return options.failOnUnsupported
+        ? { status: 400, message: 'agent is required' }
+        : { status: 204 };
+    }
+    const prevBeforeEnsure = record.session.agent;
+    record.pendingMode = wanted;
+    try {
+      const { agent, sessionId: acpSessionId } = await this.ensureAgent(record);
+      const sessionOptions = agent.configOptionsFor(acpSessionId);
+      const switchOptions = sessionOptions.length > 0 ? sessionOptions : agent.anyConfigOptions();
+      const option = switchOptions.find(isModeOption);
+      if (!option) return { status: 204 };
+      const choices = modeChoicesOf(option);
+      if (choices.length === 0) return { status: 204 };
+      if (!choices.some((choice) => choice.value === wanted)) {
+        if (
+          wanted === this.backendName() ||
+          wanted === PLACEHOLDER_BACKEND ||
+          !options.failOnUnsupported
+        ) {
+          this.log(`[bridge] /agent: ignoring non-mode selection '${wanted}'`);
+          return { status: 204 };
+        }
+        this.log(`[bridge] /agent: '${wanted}' is not offered by this session's agent; refusing`);
+        return { status: 400, message: `this session's agent does not offer mode '${wanted}'` };
+      }
+      const current = modeFromConfigOptions(switchOptions);
+      const previous = prevBeforeEnsure ?? current;
+      if (current !== wanted) {
+        await agent.setConfig(acpSessionId, String(option.id ?? option.configId ?? 'mode'), wanted);
+        this.log(`[bridge] mode -> ${wanted}`);
+      } else {
+        this.log(`[bridge] /agent: ${wanted} is already selected; not calling the agent`);
+      }
+      record.session.agent = wanted;
+      if (record.acpSessionId || this.sessionMap.acpIdFor(record.session.id)) {
+        this.sessionMap.rememberMode(record.session.id, wanted);
+        this.sessionMap.flush();
+      }
+      if (options.emitSelected && previous !== wanted) {
+        this.hub.emit({
+          type: EVENT.agentSelected,
+          data: {
+            sessionID: record.session.id,
+            agent: wanted,
+            ...(previous ? { previous } : {}),
+          },
+          location: this.location,
+        });
+      }
+      return { status: 204 };
+    } catch (err) {
+      const text = err instanceof Error ? err.message : String(err);
+      this.log(`[bridge] /agent failed: ${text}`);
+      return options.failOnUnsupported
+        ? { status: 400, message: `the agent refused the mode switch: ${text}` }
+        : { status: 204 };
+    } finally {
+      record.pendingMode = undefined;
+    }
+  }
+
+  private defaultModeFor(record?: SessionRecord): string | undefined {
+    const option = this.modeOptionFor(record);
+    if (!option) return undefined;
+    const choices = modeChoicesOf(option);
+    if (choices.length === 0) return undefined;
+    if (
+      typeof option.currentValue === 'string' &&
+      choices.some((choice) => choice.value === option.currentValue)
+    ) {
+      return option.currentValue;
+    }
+    return choices[0]?.value;
+  }
+
+  private async reconcileSessionMode(
+    record: SessionRecord,
+    agent: AcpClient,
+    acpSessionId: string,
+    overrideMode?: string,
+  ): Promise<void> {
+    const option = agent.configOptionsFor(acpSessionId).find(isModeOption);
+    if (!option) return;
+    const choices = modeChoicesOf(option);
+    if (choices.length === 0) return;
+    const desired =
+      record.pendingMode ??
+      overrideMode ??
+      this.sessionMap.modeFor(record.session.id);
+    record.pendingMode = undefined;
+    if (
+      desired &&
+      choices.some((choice) => choice.value === desired) &&
+      option.currentValue !== desired
+    ) {
+      try {
+        await agent.setConfig(acpSessionId, String(option.id ?? option.configId ?? 'mode'), desired);
+        this.log(`[bridge] restored sticky mode -> ${desired}`);
+      } catch (err) {
+        this.log(
+          `[bridge] could not restore sticky mode '${desired}': ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    const finalMode = modeFromConfigOptions(agent.configOptionsFor(acpSessionId)) ?? option.currentValue;
+    if (finalMode) record.session.agent = finalMode;
+    this.emitAgentUpdated(record);
+  }
+
+  private agentCatalog(only?: SessionRecord): Array<Record<string, unknown>> {
+    const option = this.modeOptionFor(only);
+    if (!option) return [this.primaryAgent()];
+    const choices = modeChoicesOf(option);
+    if (choices.length === 0) return [this.primaryAgent()];
+    // Preserve the agent's canonical mode order and omit explicit colors so the TUI
+    // derives consistent colors from the user's active opencode theme.
+    return choices.map((choice) => ({
+      id: choice.value,
+      name: choice.name || choice.value,
+      ...(typeof choice.description === 'string' && choice.description.trim()
+        ? { description: choice.description }
+        : {}),
+      mode: 'primary',
+      hidden: false,
+      request: { settings: {}, headers: {}, body: {} },
+      permissions: [],
+    }));
+  }
+
   /**
    * Project ACP's `session/new` config options into opencode's model/provider
    * catalogue. the backend advertises models through one option (category `model`)
@@ -4217,28 +4504,7 @@ export class BridgeServer {
     models: Array<Record<string, unknown>>;
     providers: Array<Record<string, unknown>>;
   } {
-    // One connection can host several sessions, and each session has its own catalog.
-    // Iterate SESSIONS (with their agent), not connections, or the union would only see
-    // whichever session touched its connection last.
-    const live: Array<{ record: SessionRecord; agent: AcpClient }> = only
-      ? (() => {
-          const sameAgent = (candidate: SessionRecord): boolean =>
-            agentBindingLabel(candidate.agent ?? this.agentBinding()) ===
-            agentBindingLabel(only.agent ?? this.agentBinding());
-          const ordered: Array<{ record: SessionRecord; agent: AcpClient }> = [];
-          const onlyAgent = this.agents.get(only.session.id);
-          if (onlyAgent) ordered.push({ record: only, agent: onlyAgent });
-          for (const candidate of this.state.all()) {
-            if (candidate.session.id === only.session.id || !sameAgent(candidate)) continue;
-            const candidateAgent = this.agents.get(candidate.session.id);
-            if (candidateAgent) ordered.push({ record: candidate, agent: candidateAgent });
-          }
-          return ordered;
-        })()
-      : this.state
-          .all()
-          .map((record) => ({ record, agent: this.agents.get(record.session.id) }))
-          .filter((entry): entry is { record: SessionRecord; agent: AcpClient } => entry.agent !== undefined);
+    const live = this.liveAgentSessions(only);
     const models: Array<Record<string, unknown>> = [];
     const providers = new Map<string, Record<string, unknown>>();
 
@@ -4439,8 +4705,9 @@ export class BridgeServer {
       const directory = this.sessionMap.directoryFor(oldId) ?? record.directory ?? this.options.directory;
       const title = this.sessionMap.titleFor(oldId);
       const agent = this.sessionMap.agentFor(oldId) ?? record.agent ?? this.agentBinding();
+      const mode = this.sessionMap.modeFor(oldId) ?? record.session.agent;
       this.sessionMap.forget(oldId);
-      this.sessionMap.remember(newId, pairing, directory, title, agent);
+      this.sessionMap.remember(newId, pairing, directory, title, agent, false, mode);
       this.sessionMap.flush();
       this.log(`[bridge] session map: ${oldId} -> ${newId} keeps the agent pairing ${pairing}`);
     }
@@ -4591,6 +4858,8 @@ export class BridgeServer {
         // load branch below mutes the translator for its replay window, so the replay
         // still lands only in `record.history` and never renders twice.
         this.attachTranslator(record, agent);
+        this.mutingModeUpdates.add(record.session.id);
+        try {
         // ★ The record's OWN id wins; the options-level `resumeSession` is for the
         // pre-created resume record ONLY (it has no acpSessionId of its own yet).
         // The reversed precedence — `resumeSession ?? record.acpSessionId` — made
@@ -4665,6 +4934,9 @@ export class BridgeServer {
                 // `(unavailable)` and the composer stays locked on the restored session.
                 this.emitModelUpdated(record);
                 emittedModelUpdate = true;
+                if (options?.some(isModeOption)) {
+                  this.emitAgentUpdated(record);
+                }
                 // The session's own model has to move with it. `session.step.started` carries
                 // `model: record.model ? {...} : undefined`, and the client inserts the assistant
                 // row from that event before dereferencing `message.model.providerID` in its
@@ -4695,6 +4967,7 @@ export class BridgeServer {
                 emittedModelUpdate = true;
               }
               this.rememberPairing(record.session.id, wanted, directory, false, record.agent ?? this.agentBinding());
+              await this.reconcileSessionMode(record, agent, wanted);
             } catch (firstErr) {
               // Measured with dsh: a load that arrives moments after the agent's
               // initialize — or while another process still holds the session
@@ -4716,6 +4989,7 @@ export class BridgeServer {
                   emittedModelUpdate = true;
                 }
                 this.rememberPairing(record.session.id, wanted, directory, false, record.agent ?? this.agentBinding());
+                await this.reconcileSessionMode(record, agent, wanted);
               } catch (err) {
                 // Measured, twice: an agent that advertises loadSession and then
                 // declines made this throw with nothing to catch it, so the rejection
@@ -4750,6 +5024,7 @@ export class BridgeServer {
                   this.adoptCatalogModels();
                   this.emitModelUpdated(record);
                 }
+                await this.reconcileSessionMode(record, agent, fresh.sessionId);
               }
             } finally {
               collecting = false;
@@ -4812,6 +5087,7 @@ export class BridgeServer {
                   `model still has the earlier conversation is up to the agent — measured both ways on the same profile`,
               );
               this.rememberPairing(record.session.id, wanted, directory, false, record.agent ?? this.agentBinding());
+              await this.reconcileSessionMode(record, agent, wanted);
               // ★ No title marker (owner's call, 2026-10-18): the notice in the transcript
               // already says why the history is missing, so the tab keeps the conversation's
               // real name. Base it on the map's remembered name — `-s` pre-creates the record
@@ -4856,6 +5132,7 @@ export class BridgeServer {
                 this.adoptCatalogModels();
                 this.emitModelUpdated(record);
               }
+              await this.reconcileSessionMode(record, agent, fresh.sessionId);
             }
             void this.applyBackendTitle(record, agent);
             return { agent, sessionId: record.acpSessionId ?? wanted };
@@ -4885,11 +5162,13 @@ export class BridgeServer {
             this.adoptCatalogModels();
             this.emitModelUpdated(record);
           }
+          await this.reconcileSessionMode(record, agent, rescued.sessionId);
           return { agent, sessionId: rescued.sessionId };
         }
         const session = await agent.newSession((record.directory ?? this.options.directory));
         record.acpSessionId = session.sessionId;
         record.session.acpSessionId = session.sessionId;
+        const savedSessionMode = this.sessionMap.modeFor(record.session.id) ?? record.pendingMode;
         this.sessionMap.rememberBoth(
           record.session.id,
           session.sessionId,
@@ -4900,6 +5179,8 @@ export class BridgeServer {
           // this is the case where it did not.
           record.titleDerived ? record.session.title : undefined,
           record.agent ?? this.agentBinding(),
+          false,
+          savedSessionMode,
         );
         this.sessionMap.flush();
         this.log(`[bridge] session ${record.session.id} -> acp ${session.sessionId} in ${record.directory ?? this.options.directory}`);
@@ -4913,6 +5194,10 @@ export class BridgeServer {
         if (agent.configOptionsFor(session.sessionId).length > 0) {
           this.adoptCatalogModels();
           this.emitModelUpdated(record);
+        }
+        await this.reconcileSessionMode(record, agent, session.sessionId);
+        } finally {
+          this.mutingModeUpdates.delete(record.session.id);
         }
       }
       return { agent, sessionId: record.acpSessionId ?? record.session.id };
@@ -5573,6 +5858,37 @@ export function sessionListQuery<T extends { id: string; title?: string; parentI
 function isEffortOption(option: SessionConfigOption): boolean {
   const optionId = option.id ?? option.configId;
   return option.category === 'thought_level' || optionId === 'reasoning_effort' || optionId === 'effort';
+}
+
+function isModeOption(option: SessionConfigOption): boolean {
+  const optionId = option.id ?? option.configId;
+  return option.category === 'mode' || optionId === 'mode';
+}
+
+function modeChoicesOf(option: SessionConfigOption): SessionConfigSelectOption[] {
+  const choices: SessionConfigSelectOption[] = [];
+  for (const entry of option.options ?? []) {
+    const group = entry as SessionConfigSelectGroup;
+    if (Array.isArray(group.options)) {
+      for (const item of group.options) {
+        if (typeof item.value === 'string' && item.value.length > 0) choices.push(item);
+      }
+    } else {
+      const item = entry as SessionConfigSelectOption;
+      if (typeof item.value === 'string' && item.value.length > 0) choices.push(item);
+    }
+  }
+  return choices;
+}
+
+function modeFromConfigOptions(options: readonly SessionConfigOption[]): string | undefined {
+  for (const option of options) {
+    if (!isModeOption(option)) continue;
+    if (typeof option.currentValue === 'string' && option.currentValue.length > 0) {
+      return option.currentValue;
+    }
+  }
+  return undefined;
 }
 
 function modelFromConfigOptions(

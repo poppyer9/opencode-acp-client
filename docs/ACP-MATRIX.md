@@ -107,8 +107,8 @@ nine client capabilities ACP v1 defines divide up like this:
 | `session/load` | ✅ | `--session <id>`; the replay becomes the transcript. Gated by the **agent's** `loadSession`, not a client capability. An agent that advertises it and then fails is retried once, then the tab is re-titled `[new conversation] <dir>` (logged with the likely cause: another process holds the session) |
 | `session/resume` | ✅ | Only when the agent advertises `sessionCapabilities.resume` |
 | `session/list` | ✅ | `GET /api/session` imports titled agent sessions under stable bridge `ses_…` aliases, so their ACP id, title and `session/load` path remain available; refused if the agent does not advertise `sessionCapabilities.list` |
-| `session/set_config_option` | ✅ | The model picker and reasoning effort → `session.model.selected`; the response's **complete** config state is kept, not merged |
-| `session/set_mode` | ❌ | ACP deprecates it in favour of config options (*"Dedicated session mode methods will be removed in a future version"*), which we already implement. `available_commands_update` / `current_mode_update` are logged, not rendered |
+| `session/set_config_option` | ✅ | Model picker (`model`), reasoning effort (`thought_level`) → `session.model.selected`, and session mode (`mode`) → `/api/agent` + `POST /api/session/:id/agent` + `session.agent.selected` (persisted per session for resume stickiness); the response's **complete** config state is kept, not merged |
+| `session/set_mode` | ✅ (fallback) | Used when an agent exposes legacy ACP v1 `SessionModeState` (`modes`) without a `category: "mode"` config option; otherwise `session/set_config_option` is preferred |
 | `session/close` | ❌ | no counterpart: opencode v2 has no "close but keep" verb |
 | `session/delete` | ❌ | Deliberately not called — it deletes the agent's data, and opencode v2's own delete route is the user's business |
 | `authenticate` | ❌ | Not implemented. No agent we have driven requires it; an agent that does will fail loudly rather than silently |
@@ -153,7 +153,7 @@ on a callback with no answer hangs forever, because ACP has no timeout for this.
 | `session_info_update` | ✅ | The session's title |
 | `config_option_update` | ✅ | The model/capability picker |
 | `available_commands_update` | 🟡 logged | No matching UI |
-| `current_mode_update` | 🟡 logged | Modes are deprecated (§2) |
+| `current_mode_update` | ✅ | Updates `session.agent` and emits `session.agent.selected` for agents sending legacy `SessionModeState` mode updates |
 | `notice` | ❌ never arrives | The agent does not send it: we do not advertise `session.notices` |
 | `compaction_update` | ❌ never arrives | The agent does not send it: we do not advertise `session.compaction` |
 | `compaction_summary_chunk` | ❌ never arrives | Same |

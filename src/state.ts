@@ -103,6 +103,11 @@ export interface SessionRecord {
    */
   model?: { providerID: string; modelID: string };
   /**
+   * Transient mode requested via `POST /api/session/:id/agent` while `ensureAgent`
+   * is still starting the ACP session, so startup reconciliation applies it once.
+   */
+  pendingMode?: string;
+  /**
    * A resumed session's tape, read off disk on first use and then frozen. It is
    * kept beside `messages` rather than copied into it: `messages` is the bridge's
    * own append-ordered record of what it watched happen, this is what happened

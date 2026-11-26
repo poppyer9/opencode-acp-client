@@ -89,6 +89,15 @@ export interface AcpEvents {
   log: [line: string];
 }
 
+type StandardModeState = {
+  currentModeId?: string;
+  availableModes?: Array<{ id?: string; name?: string; description?: string | null }>;
+};
+
+function isClientModeOption(option: SessionConfigOption): boolean {
+  return option.category === 'mode' || (option.id ?? option.configId) === 'mode';
+}
+
 /** Raised when the agent answered with a JSON-RPC error. */
 export class AcpError extends Error {
   constructor(
@@ -305,6 +314,7 @@ export class AcpClient extends EventEmitter<AcpEvents> {
     const result = await this.request<SessionNewResponse>('session/new', { cwd, mcpServers: [] });
     this.catalog(result.sessionId).configOptions = result.configOptions ?? [];
     this.noteStandardModels(result.sessionId, result);
+    this.noteStandardModes(result.sessionId, result);
     if (process.env.OPENCODE_ACP_CLIENT_DUMP) {
       try {
         writeFileSync(process.env.OPENCODE_ACP_CLIENT_DUMP, JSON.stringify(result, null, 2));
@@ -316,8 +326,8 @@ export class AcpClient extends EventEmitter<AcpEvents> {
   }
 
   /**
-   * Per-SESSION catalogs: the config options and the standard `models` list are
-   * session-scoped in ACP (`session/new`/`load`/`resume` each carry their own), so
+   * Per-SESSION catalogs: the config options, standard `models`, and legacy `modes` lists
+   * are session-scoped in ACP (`session/new`/`load`/`resume` each carry their own), so
    * they are kept per session id rather than in one field. One field was fine while
    * one client meant one session; a shared connection would let the newest session's
    * defaults (and a `set_config_option` meant for another session) leak across.
@@ -329,6 +339,7 @@ export class AcpClient extends EventEmitter<AcpEvents> {
       standardModels?:
         | { currentModelId?: string; availableModels?: Array<{ modelId?: string; name?: string }> }
         | undefined;
+      standardModes?: StandardModeState | undefined;
     }
   >();
   private lastSessionId: string | undefined;
@@ -339,6 +350,7 @@ export class AcpClient extends EventEmitter<AcpEvents> {
     standardModels?:
       | { currentModelId?: string; availableModels?: Array<{ modelId?: string; name?: string }> }
       | undefined;
+    standardModes?: StandardModeState | undefined;
   } {
     let state = this.catalogs.get(sessionId);
     if (!state) {
@@ -370,6 +382,57 @@ export class AcpClient extends EventEmitter<AcpEvents> {
       if (state.standardModels) return state.standardModels;
     }
     return undefined;
+  }
+
+  private anyStandardModes(): StandardModeState | undefined {
+    for (const state of this.catalogs.values()) {
+      if (state.standardModes) return state.standardModes;
+    }
+    return undefined;
+  }
+
+  private synthesizeModeOption(modes: StandardModeState): SessionConfigOption | undefined {
+    const available = (modes.availableModes ?? []).filter(
+      (mode): mode is { id: string; name?: string; description?: string | null } =>
+        typeof mode?.id === 'string' && mode.id.length > 0,
+    );
+    if (available.length === 0) return undefined;
+    return {
+      id: 'mode',
+      name: 'Mode',
+      category: 'mode',
+      type: 'select',
+      currentValue:
+        typeof modes.currentModeId === 'string' && modes.currentModeId.length > 0
+          ? modes.currentModeId
+          : available[0]!.id,
+      options: available.map((mode) => ({
+        value: mode.id,
+        name: typeof mode.name === 'string' && mode.name.length > 0 ? mode.name : mode.id,
+        ...(typeof mode.description === 'string' && mode.description.trim()
+          ? { description: mode.description }
+          : {}),
+      })),
+    };
+  }
+
+  /**
+   * ACP v1 `SessionModeState` (`modes: { currentModeId, availableModes[] }`).
+   * Used when an agent advertises modes via the legacy field instead of a `category: "mode"`
+   * entry in `configOptions`; when `configOptions` already carries modes, it wins.
+   */
+  private noteStandardModes(sessionId: string, result: SessionNewResponse): void {
+    const state = this.catalog(sessionId);
+    if (state.configOptions.some(isClientModeOption)) {
+      state.standardModes = undefined;
+      return;
+    }
+    const modes = result.modes as StandardModeState | undefined;
+    if (!modes) return;
+    const synthesized = this.synthesizeModeOption(modes);
+    if (!synthesized) return;
+    state.standardModes = modes;
+    state.configOptions = [...state.configOptions, synthesized];
   }
 
   /** Any session on this connection advertised a catalog (pool-aware). */
@@ -483,6 +546,7 @@ export class AcpClient extends EventEmitter<AcpEvents> {
     // not, whatever the notifications already applied stands.
     if (Array.isArray(result.configOptions)) this.catalog(sessionId).configOptions = result.configOptions;
     this.noteStandardModels(sessionId, result);
+    this.noteStandardModes(sessionId, result);
   }
 
   /**
@@ -509,6 +573,7 @@ export class AcpClient extends EventEmitter<AcpEvents> {
     const result = await this.request<SessionNewResponse>('session/resume', { sessionId, cwd });
     this.catalog(sessionId).configOptions = result.configOptions ?? [];
     this.noteStandardModels(sessionId, result);
+    this.noteStandardModes(sessionId, result);
     return result;
   }
 
@@ -618,6 +683,16 @@ export class AcpClient extends EventEmitter<AcpEvents> {
       if (state.standardModels) state.standardModels.currentModelId = wanted;
       return state.configOptions;
     }
+    // Agents that expose ACP v1 `SessionModeState` without a `category: "mode"` config
+    // option expect `session/set_mode` instead of `session/set_config_option`.
+    const standardModes =
+      state.standardModes ??
+      (state.configOptions.some(isClientModeOption) ? undefined : this.anyStandardModes());
+    if (configId === 'mode' && standardModes) {
+      await this.request('session/set_mode', { sessionId, modeId: value });
+      this.applyCurrentMode(sessionId, value);
+      return state.configOptions;
+    }
     // `value` goes on the wire as a bare string, NOT as the `{type:"id", value}`
     // envelope the ACP SDK types declare. the backend validates the envelope away with
     // zod and hands the inner value straight to a `typeof value !== "string"`
@@ -642,7 +717,28 @@ export class AcpClient extends EventEmitter<AcpEvents> {
    * in both, so replacing is correct — merging would keep stale values alive).
    */
   applyConfigOptions(sessionId: string, options: SessionConfigOption[] | undefined): void {
-    if (Array.isArray(options)) this.catalog(sessionId).configOptions = options;
+    if (!Array.isArray(options)) return;
+    const state = this.catalog(sessionId);
+    if (options.some(isClientModeOption)) {
+      state.standardModes = undefined;
+      state.configOptions = options;
+      return;
+    }
+    if (state.standardModes) {
+      const synthesized = this.synthesizeModeOption(state.standardModes);
+      state.configOptions = synthesized ? [...options, synthesized] : options;
+      return;
+    }
+    state.configOptions = options;
+  }
+
+  /** Record an agent-pushed or confirmed `currentModeId` / mode value for this session. */
+  applyCurrentMode(sessionId: string, modeId: string): void {
+    const state = this.catalog(sessionId);
+    if (state.standardModes) state.standardModes.currentModeId = modeId;
+    state.configOptions = state.configOptions.map((option) =>
+      isClientModeOption(option) ? { ...option, currentValue: modeId } : option,
+    );
   }
 
   /** `session/cancel` is a notification: fire and forget, per the spec. */

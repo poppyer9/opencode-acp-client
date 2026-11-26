@@ -138,6 +138,8 @@ elif [ "$MODE" = "todo" ]; then
   REPLY_TEXT="${REPLY_TEXT:-TODO_OK}"
 elif [ "$MODE" = "shell" ] || [ "$MODE" = "shell-history" ]; then
   FAKE_ENV="${FAKE_ENV:-FAKE_ACP_MODELS=1}"
+elif [ "$MODE" = "mode" ]; then
+  FAKE_ENV="${FAKE_ENV:-FAKE_ACP_MODELS=1 FAKE_ACP_MODES=1 FAKE_ACP_CAPS_LOAD_SESSION=1 FAKE_ACP_MODE_IN_REPLY=1}"
 else
   # The default history run uses the interleaved scenario on purpose: text before a tool and
   # text after it is the shape that once made the turn-end event overwrite the final text with
@@ -1631,6 +1633,70 @@ if [ "$MODE" = "restore-tab" ]; then
     printf '%s' "$RELOADED" | grep -q 'acp/unknown' \
       && fail "the restored transcript names the placeholder model (acp/unknown)"
     ok "the restored transcript names a real model"
+  fi
+  exit "$FAILED"
+fi
+
+# ---------------------------------------------------------------------------
+# `MODE=mode` — ACP `category: "mode"` switching via Shift+Tab and per-session sticky resume.
+# ---------------------------------------------------------------------------
+if [ "$MODE" = "mode" ]; then
+  tmux new-session -d -s "$CLIENT" -x 110 -y 34 "cd $WORK && OPENCODE_DISABLE_AUTOUPDATE=1 $OC --server $URL"
+  wait_for_pane 'Ask anything' 'the composer' 180 || fail "the TUI never became ready for input"
+  wait_for_pane 'Default' 'the initial Default mode' 30 || fail "the composer never showed Default mode"
+  ok "initial mode Default is on screen"
+
+  tmux send-keys -t "$CLIENT" BTab
+  wait_for_pane_ci 'accept[- ]edits' 'Accept edits mode after first Shift+Tab' 15 || fail "Shift+Tab did not advance to Accept edits"
+  tmux send-keys -t "$CLIENT" BTab
+  wait_for_pane_ci '\bauto\b' 'Auto mode after second Shift+Tab' 15 || fail "Shift+Tab did not advance to Auto"
+  ok "switched mode to Auto with Shift+Tab"
+
+  send_prompt "first mode check"
+  wait_for_pane '\[mode=auto\]' 'the reply executed in auto mode' 60 \
+    && ok "first turn ran in [mode=auto]" \
+    || fail "first turn did not run in auto mode"
+  PANE_MODE1="$(tmux capture-pane -p -t "$CLIENT")"
+  save_pane mode-first "$PANE_MODE1"
+  if printf '%s' "$PANE_MODE1" | grep -q 'UnexpectedStatus'; then
+    fail "UnexpectedStatus appeared during live mode switch"
+  fi
+  SESSION_ID="$(grep -o 'POST /api/session/[^/]*/prompt' "$LOG" 2>/dev/null | tail -1 | sed 's|POST /api/session/||; s|/prompt||')"
+  [ -n "$SESSION_ID" ] && ok "captured session $SESSION_ID" || { fail "no session id in bridge log"; exit 1; }
+
+  tmux kill-session -t "$CLIENT" 2>/dev/null || true
+  tmux kill-session -t "$BRIDGE" 2>/dev/null || true
+  sleep 1
+
+  tmux new-session -d -s "$BRIDGE" -x 110 -y 34 \
+    "cd $REPO && env $FAKE_ENV OPENCODE_BIN="$OC" OPENCODE_ACP_CLIENT_SESSION_MAP=$WORK/sessions.json node dist/index.js --no-tui --bridge-port $PORT $WORK \
+     --bridge-log $LOG -- node $REPO/tests/fake-acp-agent.mjs"
+  for _ in $(seq 1 40); do sleep 0.5; curl -s -m 2 -o /dev/null "$URL/api/info" && break; done
+  curl -s -m 2 -o /dev/null "$URL/api/info" || { fail "the restarted bridge never came up"; exit 1; }
+  ok "restarted the bridge"
+
+  tmux new-session -d -s "$CLIENT" -x 110 -y 34 "cd $WORK && OPENCODE_DISABLE_AUTOUPDATE=1 $OC --server $URL"
+  wait_for_pane 'Ask anything' 'the home screen composer after restart' 180 || fail "the TUI never became ready after restart"
+  wait_for_pane 'Default' 'canonical Default mode on home screen after restart' 30 \
+    && ok "Home screen starts on canonical Default mode after restart" \
+    || fail "Home screen did not show canonical Default mode after restart"
+  save_pane mode-home-after-restart "$(tmux capture-pane -p -t "$CLIENT")"
+  tmux kill-session -t "$CLIENT" 2>/dev/null || true
+  sleep 1
+
+  tmux new-session -d -s "$CLIENT" -x 110 -y 34 "cd $WORK && OPENCODE_DISABLE_AUTOUPDATE=1 $OC --server $URL --session $SESSION_ID"
+  wait_for_pane 'Auto' 'sticky Auto mode on resumed session' 180 \
+    && ok "Auto mode persisted on screen for resumed session" \
+    || fail "sticky Auto mode did not appear on screen for resumed session"
+
+  send_prompt "after resume check"
+  wait_for_pane '\[mode=auto\]' 'the post-resume reply in auto mode' 60 \
+    && ok "post-resume turn ran in [mode=auto]" \
+    || fail "post-resume turn did not run in auto mode"
+  PANE_MODE2="$(tmux capture-pane -p -t "$CLIENT")"
+  save_pane mode-resumed "$PANE_MODE2"
+  if printf '%s' "$PANE_MODE2" | grep -q 'UnexpectedStatus'; then
+    fail "UnexpectedStatus appeared after resume"
   fi
   exit "$FAILED"
 fi

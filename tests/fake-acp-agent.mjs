@@ -23,6 +23,11 @@
  *   FAKE_ACP_HANG_TOOL=1             with HANG: a shell tool in flight, failed only AFTER the cancel
  *   FAKE_ACP_CALLBACK=fs/read_text_file   call back into the client
  *   FAKE_ACP_MODELS=1                session/new advertises a `model` config option
+ *   FAKE_ACP_MODES=1                 session/new advertises a `mode` config option (`default|accept-edits|auto|plan`)
+ *   FAKE_ACP_LEGACY_MODES=1          session/new/load/resume advertise ACP `modes` (`code|architect|ask`) + `session/set_mode`
+ *   FAKE_ACP_MODE_IN_REPLY=1         include `[mode=<current>]` in prompt replies
+ *   FAKE_ACP_MODE_UPDATE=<mode>      emit a `config_option_update` moving mode during a prompt
+ *   FAKE_ACP_CURRENT_MODE_UPDATE=<m> emit a `current_mode_update` moving mode during a prompt
  *   FAKE_ACP_ADVERSARIAL_TOOL_ID=1   a tool call whose id looks like a content part (`reasoning:0`)
  *   FAKE_ACP_REPLAY_ON_LOAD=1        replay a message on session/load (a real agent replays what it
  *                                    recorded; without this an empty load makes "restored transcript"
@@ -225,6 +230,69 @@ function effortOption() {
   }
 }
 
+const VALID_MODES = ['default', 'accept-edits', 'auto', 'plan']
+const VALID_LEGACY_MODES = ['code', 'architect', 'ask']
+
+function defaultModeValue() {
+  return process.env.FAKE_ACP_LEGACY_MODES === '1' && process.env.FAKE_ACP_MODES !== '1'
+    ? 'code'
+    : 'default'
+}
+
+function legacyModesState(currentModeId = defaultModeValue()) {
+  return {
+    currentModeId,
+    availableModes: [
+      { id: 'code', name: 'Code', description: 'Write and edit code.' },
+      { id: 'architect', name: 'Architect', description: 'Design and plan changes.' },
+      { id: 'ask', name: 'Ask' },
+    ],
+  }
+}
+
+function modeOption(currentValue = 'default') {
+  return {
+    id: 'mode',
+    name: 'Mode',
+    category: 'mode',
+    type: 'select',
+    currentValue,
+    options: [
+      { value: 'default', name: 'Default', description: 'Ask before edits and commands, per your permission settings.' },
+      { value: 'accept-edits', name: 'Accept edits', description: 'Approve file edits in the workspace without asking.' },
+      { value: 'auto', name: 'Auto', description: 'Approve edits and safe commands; ask before irreversible actions.' },
+      { value: 'plan', name: 'Plan', description: 'Plan carefully before executing a task.' },
+    ],
+  }
+}
+
+function configOptionsFor(sessionId, overrides = {}) {
+  const session = sessions.get(sessionId) ?? { model: '["fake","model-1"]', mode: defaultModeValue() }
+  const model = overrides.model ?? session.model ?? '["fake","model-1"]'
+  const mode = overrides.mode ?? session.mode ?? defaultModeValue()
+  const list = []
+  if (process.env.FAKE_ACP_MODELS_SUFFIXED === '1') {
+    list.push({
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: 'suffixed-1',
+      options: [
+        { value: 'suffixed-1', name: 'Suffixed One' },
+        { value: 'suffixed-2', name: 'Suffixed Two' },
+      ],
+    })
+  } else if (process.env.FAKE_ACP_MODELS === '1') {
+    list.push(modelOption(model))
+    if (process.env.FAKE_ACP_EFFORT === '1') list.push(effortOption())
+  }
+  if (process.env.FAKE_ACP_MODES === '1') {
+    list.push(modeOption(mode))
+  }
+  return list
+}
+
 function update(sessionId, u) {
   notify('session/update', { sessionId, update: u })
 }
@@ -345,11 +413,29 @@ async function runPrompt(sessionId, prompt) {
     .join('')
 
   // The agent moving the session's own configuration: the spec says an update
-  // carries the *complete* state, so this replaces the model option wholesale.
+  // carries the *complete* state, so this replaces the model/mode option wholesale.
   if (process.env.FAKE_ACP_MODEL_UPDATE) {
+    const session = sessions.get(sessionId)
+    if (session) session.model = process.env.FAKE_ACP_MODEL_UPDATE
     update(sessionId, {
       sessionUpdate: 'config_option_update',
-      configOptions: [modelOption(process.env.FAKE_ACP_MODEL_UPDATE)],
+      configOptions: configOptionsFor(sessionId, { model: process.env.FAKE_ACP_MODEL_UPDATE }),
+    })
+  }
+  if (process.env.FAKE_ACP_MODE_UPDATE) {
+    const session = sessions.get(sessionId)
+    if (session) session.mode = process.env.FAKE_ACP_MODE_UPDATE
+    update(sessionId, {
+      sessionUpdate: 'config_option_update',
+      configOptions: configOptionsFor(sessionId, { mode: process.env.FAKE_ACP_MODE_UPDATE }),
+    })
+  }
+  if (process.env.FAKE_ACP_CURRENT_MODE_UPDATE) {
+    const session = sessions.get(sessionId)
+    if (session) session.mode = process.env.FAKE_ACP_CURRENT_MODE_UPDATE
+    update(sessionId, {
+      sessionUpdate: 'current_mode_update',
+      currentModeId: process.env.FAKE_ACP_CURRENT_MODE_UPDATE,
     })
   }
 
@@ -709,7 +795,8 @@ async function runPrompt(sessionId, prompt) {
       // Where the agent believes the session runs. `session/new`/`session/load` both record
       // it, so a `/cd` acceptance can assert on screen that the re-load actually moved the
       // session — the bridge state alone would prove nothing about the agent.
-      (process.env.FAKE_ACP_CWD_IN_REPLY === '1' ? ` (cwd: ${sessions.get(sessionId)?.cwd ?? 'unknown'})` : '')
+      (process.env.FAKE_ACP_CWD_IN_REPLY === '1' ? ` (cwd: ${sessions.get(sessionId)?.cwd ?? 'unknown'})` : '') +
+      (process.env.FAKE_ACP_MODE_IN_REPLY === '1' ? ` [mode=${sessions.get(sessionId)?.mode ?? defaultModeValue()}]` : '')
   for (const chunk of chunksOf(reply)) {
     update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: chunk } })
   }
@@ -849,17 +936,22 @@ async function onMessage(msg) {
       }
       nextSession += 1
       const sessionId = `fake-session-${nextSession}`
-      sessions.set(sessionId, { cwd: msg.params?.cwd ?? process.cwd() })
+      sessions.set(sessionId, {
+        cwd: msg.params?.cwd ?? process.cwd(),
+        model: '["fake","model-1"]',
+        mode: defaultModeValue(),
+      })
       // A load must report the configuration too, not just the replayed messages. A restore never
       // goes through `session/new`, so a fixture that only advertised its models there left the
       // bridge on the `acp/default` placeholder for the whole restored session — and anything that
       // needs a real model (the card footer, the replay repair) had nothing to resolve against.
       // Measured: after a restart the catalog read `real=none` on every request, while before the
       // restart it read `real=fake/model-1`.
-      if (process.env.FAKE_ACP_MODELS === '1') {
+      const initialOptions = configOptionsFor(sessionId)
+      if (initialOptions.length > 0 && process.env.FAKE_ACP_MODELS_SUFFIXED !== '1') {
         notify('session/update', {
           sessionId,
-          update: { sessionUpdate: 'config_option_update', configOptions: [modelOption('["fake","model-1"]')] },
+          update: { sessionUpdate: 'config_option_update', configOptions: initialOptions },
         })
       }
       // The agent's slash commands, announced as the agent comes up — the same timing dsh
@@ -885,31 +977,7 @@ async function onMessage(msg) {
       // ★ `FAKE_ACP_MODELS_SUFFIXED=1` reproduces codex-acp 2.8.0 (see below); declared
       // before `configOptions` because that line reads it.
       const suffixed = process.env.FAKE_ACP_MODELS_SUFFIXED === '1'
-      // The suffixed shape carries its OWN option list: `modelOption()` hard-codes
-      // `fake/model-1` and `fake/model-2`, and reusing it here put those in the picker
-      // alongside the suffixed model — the test then could not tell which surface won.
-      const configOptions = suffixed
-        ? [{
-            id: 'model',
-            name: 'Model',
-            category: 'model',
-            type: 'select',
-            currentValue: 'suffixed-1',
-            options: [
-              { value: 'suffixed-1', name: 'Suffixed One' },
-              { value: 'suffixed-2', name: 'Suffixed Two' },
-            ],
-          }]
-        : process.env.FAKE_ACP_MODELS === '1'
-        ? [
-            modelOption('["fake","model-1"]'),
-            // ★ `FAKE_ACP_EFFORT=1` reproduces an agent that calls the reasoning-effort option
-            // `effort` — dsh's name for it. The bridge used to match only `thought_level` /
-            // `reasoning_effort`, so those variants never reached the picker and the user could
-            // not switch thinking on from the TUI.
-            ...(process.env.FAKE_ACP_EFFORT === '1' ? [effortOption()] : []),
-          ]
-        : undefined
+      const configOptions = initialOptions.length > 0 ? initialOptions : undefined
       // The ACP-standard model list, which real agents (qwen, gemini, kimi) use
       // instead of an opencode-shaped config option.
       // ★ `FAKE_ACP_MODELS_SUFFIXED=1` reproduces codex-acp 2.8.0: the session's
@@ -932,11 +1000,30 @@ async function onMessage(msg) {
                   ],
             }
           : undefined
+      const standardModes =
+        process.env.FAKE_ACP_LEGACY_MODES === '1' ? legacyModesState(defaultModeValue()) : undefined
       respond(msg.id, {
         sessionId,
         ...(configOptions ? { configOptions } : {}),
         ...(standardModels ? { models: standardModels } : {}),
+        ...(standardModes ? { modes: standardModes } : {}),
       })
+      return
+    }
+    case 'session/set_mode': {
+      if (process.env.FAKE_ACP_SET_CONFIG_FAILS === '1') {
+        respondError(msg.id, -32602, 'Invalid params: mode switch refused by the fixture')
+        return
+      }
+      const value = msg.params?.modeId
+      if (typeof value !== 'string' || !VALID_LEGACY_MODES.includes(value)) {
+        respondError(msg.id, -32602, `Invalid params: modeId must be one of ${VALID_LEGACY_MODES.join(', ')}`)
+        return
+      }
+      const session = sessions.get(msg.params?.sessionId)
+      if (session) session.mode = value
+      process.stderr.write(`[fake] set legacy mode=${value}\n`)
+      respond(msg.id, {})
       return
     }
     case 'session/set_model': {
@@ -986,7 +1073,19 @@ async function onMessage(msg) {
         }
         effortValue = msg.params.value
         process.stderr.write(`[fake] set effort=${effortValue}\n`)
-        respond(msg.id, { configOptions: [modelOption('["fake","model-1"]'), effortOption()] })
+        respond(msg.id, { configOptions: configOptionsFor(msg.params?.sessionId) })
+        return
+      }
+      if (msg.params?.configId === 'mode') {
+        const value = msg.params?.value
+        if (typeof value !== 'string' || !VALID_MODES.includes(value)) {
+          respondError(msg.id, -32602, `Invalid params: mode must be one of ${VALID_MODES.join(', ')}`)
+          return
+        }
+        const session = sessions.get(msg.params?.sessionId)
+        if (session) session.mode = value
+        process.stderr.write(`[fake] set mode=${value}\n`)
+        respond(msg.id, { configOptions: configOptionsFor(msg.params?.sessionId, { mode: value }) })
         return
       }
       const advertised = ['["fake","model-1"]', '["fake","model-2"]']
@@ -995,7 +1094,9 @@ async function onMessage(msg) {
         respondError(msg.id, -32602, `Invalid params: model value must be one of ${advertised.join(', ')}`)
         return
       }
-      respond(msg.id, { configOptions: [modelOption(value)] })
+      const session = sessions.get(msg.params?.sessionId)
+      if (session) session.model = value
+      respond(msg.id, { configOptions: configOptionsFor(msg.params?.sessionId, { model: value }) })
       return
     }
     case 'session/delete': {
@@ -1032,13 +1133,19 @@ async function onMessage(msg) {
       // Resume = reconnect to the agent's existing context WITHOUT replaying
       // history. So: adopt the id, send NO transcript, and report configuration
       // (the bridge's model catalog comes from these options on a restore).
-      sessions.set(sessionId, { cwd: msg.params?.cwd ?? process.cwd() })
+      sessions.set(sessionId, {
+        cwd: msg.params?.cwd ?? process.cwd(),
+        model: process.env.FAKE_ACP_RESUME_MODEL ?? '["fake","model-1"]',
+        mode: defaultModeValue(),
+      })
+      const resumeOptions = configOptionsFor(sessionId, {
+        model: process.env.FAKE_ACP_RESUME_MODEL ?? '["fake","model-1"]',
+      })
+      const resumeModes =
+        process.env.FAKE_ACP_LEGACY_MODES === '1' ? legacyModesState(defaultModeValue()) : undefined
       respond(msg.id, {
-        ...(process.env.FAKE_ACP_RESUME_MODEL
-          ? { configOptions: [modelOption(process.env.FAKE_ACP_RESUME_MODEL)] }
-          : process.env.FAKE_ACP_MODELS === '1'
-            ? { configOptions: [modelOption('["fake","model-1"]')] }
-            : {}),
+        ...(resumeOptions.length > 0 ? { configOptions: resumeOptions } : {}),
+        ...(resumeModes ? { modes: resumeModes } : {}),
       })
       return
     }
@@ -1065,18 +1172,26 @@ async function onMessage(msg) {
         respondError(msg.id, -32601, 'session/load not supported')
         return
       }
-      sessions.set(sessionId, { cwd: msg.params?.cwd ?? process.cwd() })
+      sessions.set(sessionId, {
+        cwd: msg.params?.cwd ?? process.cwd(),
+        model: '["fake","model-1"]',
+        mode: defaultModeValue(),
+      })
       // A restored session never goes through `session/new`, so a load has to report the
       // configuration itself. Without this the bridge's `record.model` stays unset, the next
       // `session.step.started` carries `model: undefined`, and the client — which dereferences
       // `message.model.providerID` without a guard — crashes on the next turn.
       const inResponse = process.env.FAKE_ACP_LOAD_MODELS_IN_RESPONSE === '1'
-      if (process.env.FAKE_ACP_MODELS === '1' && process.env.FAKE_ACP_LOAD_NO_MODELS !== '1' && !inResponse) {
+      const loadOptions =
+        process.env.FAKE_ACP_LOAD_NO_MODELS === '1'
+          ? (process.env.FAKE_ACP_MODES === '1' ? [modeOption('default')] : [])
+          : configOptionsFor(sessionId)
+      if (loadOptions.length > 0 && !inResponse) {
         notify('session/update', {
           sessionId,
           update: {
             sessionUpdate: 'config_option_update',
-            configOptions: [modelOption('["fake","model-1"]')],
+            configOptions: loadOptions,
           },
         })
       }
@@ -1126,7 +1241,12 @@ async function onMessage(msg) {
           content: { type: 'text', text: 'all checked' },
         })
       }
-      respond(msg.id, inResponse ? { configOptions: [modelOption('["fake","model-1"]')] } : {})
+      const loadModes =
+        process.env.FAKE_ACP_LEGACY_MODES === '1' ? legacyModesState(defaultModeValue()) : undefined
+      respond(msg.id, {
+        ...(inResponse && loadOptions.length > 0 ? { configOptions: loadOptions } : {}),
+        ...(loadModes ? { modes: loadModes } : {}),
+      })
       if (process.env.FAKE_ACP_POST_LOAD_META === '1') {
         setTimeout(() => {
           update(sessionId, {

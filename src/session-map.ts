@@ -55,6 +55,8 @@ export interface SessionMapEntry {
   directory?: string;
   /** Optional title returned by stable ACP session/list; never message content. */
   title?: string;
+  /** Sticky ACP mode id last selected by the user for this session. */
+  mode?: string;
   /**
    * The agent command that created the session. ACP has no notion of "which agent owns
    * this session", so without this the bridge would hand a remembered id to whatever
@@ -132,6 +134,7 @@ export class SessionMap {
               ...(typeof entry.createdAt === 'number' ? { createdAt: entry.createdAt } : {}),
               ...(typeof entry.directory === 'string' ? { directory: entry.directory } : {}),
               ...(typeof entry.title === 'string' && entry.title.trim() ? { title: entry.title } : {}),
+              ...(typeof entry.mode === 'string' && entry.mode.trim() ? { mode: entry.mode } : {}),
               ...(parseBinding((entry as { agent?: unknown }).agent) ? { agent: parseBinding((entry as { agent?: unknown }).agent) } : {}),
               updatedAt,
             };
@@ -200,6 +203,18 @@ export class SessionMap {
     return this.load()[visibleId]?.title;
   }
 
+  modeFor(visibleId: string): string | undefined {
+    return this.load()[visibleId]?.mode;
+  }
+
+  /** Remember a session's sticky mode without touching `updatedAt` (preserves `-c` recency). */
+  rememberMode(visibleId: string, mode: string): void {
+    const existing = this.load()[visibleId];
+    if (!existing || existing.mode === mode) return;
+    existing.mode = mode;
+    this.dirty = true;
+  }
+
   /**
    * The agent binding that created a remembered session, when it was recorded. `undefined`
    * for entries written before the field existed — those keep the launching agent.
@@ -246,10 +261,12 @@ export class SessionMap {
     title?: string,
     agent?: AgentBinding,
     used = false,
+    mode?: string,
   ): void {
     const data = this.load();
     const existing = data[visibleId];
     const nextTitle = title?.trim() || existing?.title;
+    const nextMode = mode?.trim() || existing?.mode;
     const nextAgent = agent || existing?.agent;
     const sameAgent =
       existing?.agent === nextAgent ||
@@ -261,6 +278,7 @@ export class SessionMap {
       existing.acpSessionId === acpSessionId &&
       existing.directory === directory &&
       existing.title === nextTitle &&
+      existing.mode === nextMode &&
       sameAgent
     ) {
       // Nothing to write but recency: a prompt still means "this is the conversation I am
@@ -277,6 +295,7 @@ export class SessionMap {
       createdAt: existing?.createdAt ?? Date.now(),
       ...(directory ? { directory } : {}),
       ...(nextTitle ? { title: nextTitle } : {}),
+      ...(nextMode ? { mode: nextMode } : {}),
       ...(nextAgent ? { agent: nextAgent } : {}),
       // A NEW row has no earlier stamp to keep, so it takes one even for metadata: the cap
       // (`MAX_ENTRIES`, sorted by `updatedAt`) needs every row dated.
@@ -318,8 +337,9 @@ export class SessionMap {
     title?: string,
     agent?: AgentBinding,
     used = false,
+    mode?: string,
   ): void {
-    this.remember(visibleId, acpSessionId, directory, title, agent, used);
+    this.remember(visibleId, acpSessionId, directory, title, agent, used, mode);
   }
 
   /** Write if anything changed. Failures are logged, never fatal: the map is an optimisation. */
@@ -356,10 +376,10 @@ export class SessionMap {
       // Write-then-rename: a reader (another bridge loading, or `-s`) must never see
       // a half-written map, and a crash mid-write must not truncate it.
       const temporary = `${path}.${process.pid}.tmp`;
-      const payload =
-        this.tombstones.size > 0
-          ? { ...Object.fromEntries(entries), [TOMBSTONE_KEY]: Object.fromEntries(this.tombstones) }
-          : Object.fromEntries(entries);
+      const payload = {
+        ...Object.fromEntries(entries),
+        ...(this.tombstones.size > 0 ? { [TOMBSTONE_KEY]: Object.fromEntries(this.tombstones) } : {}),
+      };
       writeFileSync(temporary, JSON.stringify(payload, null, 2), 'utf8');
       renameSync(temporary, path);
       this.dirty = false;
