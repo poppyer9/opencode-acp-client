@@ -3275,7 +3275,7 @@ export class BridgeServer {
       json(
         {
           error: `attachment not supported: ${unsupported.join(', ')}`,
-          detail: 'this client can forward image attachments only — it announces no fs/* or terminal/* capability',
+          detail: 'this client can forward image attachments and file:// resource links only — it announces no fs/* or terminal/* capability',
         },
         400,
       );
@@ -5939,32 +5939,23 @@ function modelFromConfigOptions(
 
 
 /**
- * Attachments we cannot forward. An image can be passed to the agent as an ACP
- * image block, but nothing else can: we announce no `fs/*` and no `terminal/*`, so
- * a file's *contents* have no route. It must not be dropped in silence — that is
- * the failure this function exists to make impossible.
- *
- * A file is forwardable when it carries inline image data (`{data, mime: image/*}`),
- * OR when it is a `file://` URI whose name or mime says image — the real TUI's
- * `@file` picker sends exactly that shape (measured v2.0.30), and reading the
- * local file it names is the only way to build the ACP image block the agent
- * expects.
+ * Attachments we cannot forward. Images travel as ACP `image` blocks, and any
+ * other `file://` URI (file or directory from the TUI's `@` picker) travels as
+ * an ACP `resource_link` block — baseline in ACP, requiring no `fs/*` client
+ * callback. Only an inline non-image blob (`{data, mime}` with no `file://`
+ * URI) has no route and must be refused with 400 rather than dropped silently.
  */
 export function unsupportedAttachments(payload: PromptBody): string[] {
   return (payload.files ?? [])
-    .filter((file) => !isForwardableImage(file))
+    .filter((file) => !isForwardableAttachment(file))
     .map((file) => file.name ?? file.mime ?? 'attachment');
 }
 
 /** Does this attachment have a route to the agent? (see unsupportedAttachments) */
-function isForwardableImage(file: { data?: string; uri?: string; mime?: string; name?: string }): boolean {
+function isForwardableAttachment(file: { data?: string; uri?: string; mime?: string; name?: string }): boolean {
   const mime = file.mime ?? '';
   if (typeof file.data === 'string' && file.data && /^image\//i.test(mime)) return true;
-  if (typeof file.uri === 'string' && file.uri.startsWith('file://')) {
-    const name = file.name ?? decodeURIComponent(file.uri).split('/').pop() ?? '';
-    const looksImage = /^image\//i.test(mime) || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(name);
-    return looksImage;
-  }
+  if (typeof file.uri === 'string' && file.uri.startsWith('file://')) return true;
   return false;
 }
 
@@ -5987,12 +5978,21 @@ export function promptParts(payload: PromptBody): Array<{ type: string; text?: s
       blocks.push({ type: 'image', data: file.data, mimeType: mime });
       continue;
     }
-    // The real TUI's `@file` picker sends a file:// URI (measured v2.0.30): read
-    // the bytes and inline them as base64 — that is the ACP image block's shape.
+    // The real TUI's `@file` picker sends a file:// URI (measured v2.0.30):
+    // images are read and inlined as base64 ACP image blocks; non-image files
+    // and directories are forwarded as baseline ACP `resource_link` blocks.
     if (typeof file.uri === 'string' && file.uri.startsWith('file://')) {
-      const name = file.name ?? decodeURIComponent(file.uri).split('/').pop() ?? '';
+      const name = file.name ?? decodeURIComponent(file.uri).replace(/\/+$/, '').split('/').pop() ?? '';
       const looksImage = /^image\//i.test(mime) || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(name);
-      if (!looksImage) continue;
+      if (!looksImage) {
+        blocks.push({
+          type: 'resource_link',
+          uri: file.uri,
+          name: name || file.uri,
+          ...(mime ? { mimeType: mime } : {}),
+        });
+        continue;
+      }
       try {
         const absolute = fileURLToPath(file.uri);
         const bytes = readFileSync(absolute);

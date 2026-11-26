@@ -97,6 +97,7 @@ const OUR_REQUESTS: Record<string, unknown> = {
       // The three block types the client can forward when the agent advertises them.
       { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
       { type: 'resource_link', uri: 'file:///tmp/a.txt', name: 'a.txt' },
+      { type: 'resource_link', uri: 'file:///tmp/a.json', name: 'a.json', mimeType: 'application/json' },
     ],
   },
   CancelNotification: { sessionId: 'ses_1' },
