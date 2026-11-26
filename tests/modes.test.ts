@@ -140,7 +140,12 @@ function isolatedMapEnv(extra: Record<string, string> = {}, existingMapPath?: st
 
 async function start(
   env: Record<string, string> = {},
-  options: { resumeSession?: string; resumeVisibleSessionId?: string; mapPath?: string } = {},
+  options: {
+    resumeSession?: string;
+    resumeVisibleSessionId?: string;
+    mapPath?: string;
+    warmCatalog?: boolean;
+  } = {},
 ): Promise<{ url: string; server: BridgeServer; mapPath: string }> {
   const { env: mergedEnv, mapPath } = isolatedMapEnv(env, options.mapPath);
   const server = new BridgeServer({
@@ -155,7 +160,7 @@ async function start(
   });
   servers.push(server);
   const { host, port } = await server.listen();
-  await server.waitForCatalog();
+  if (options.warmCatalog !== false) await server.waitForCatalog();
   return { url: `http://${host}:${port}`, server, mapPath };
 }
 
@@ -738,5 +743,65 @@ describe('ACP v1 SessionModeState (modes + session/set_mode + current_mode_updat
     ).toBe(204);
     const reply = await promptAndWaitReply(url, sessionId, 'dual surface');
     expect(reply).toContain('[mode=auto]');
+  });
+});
+
+describe('cold-start /api/agent without waitForCatalog (no-tui startup race)', () => {
+  it('warms the agent on cold GET /api/agent and GET /api/agent/:agentID when no session exists yet', async () => {
+    const { url } = await start(
+      { FAKE_ACP_MODELS: '1', FAKE_ACP_MODES: '1' },
+      { warmCatalog: false },
+    );
+
+    const listResp = await fetch(`${url}/api/agent`);
+    expect(listResp.status).toBe(200);
+    const listBody = (await listResp.json()) as { data: Array<{ id: string }> };
+    expect(listBody.data.map((entry) => entry.id)).toEqual(['default', 'accept-edits', 'auto', 'plan']);
+
+    // Also verify cold GET /api/agent/:agentID on a second fresh cold bridge.
+    const second = await start(
+      { FAKE_ACP_MODELS: '1', FAKE_ACP_MODES: '1' },
+      { warmCatalog: false },
+    );
+    const singleResp = await fetch(`${second.url}/api/agent/auto`);
+    expect(singleResp.status).toBe(200);
+    const singleBody = (await singleResp.json()) as { data: { id: string; name: string } };
+    expect(singleBody.data).toMatchObject({ id: 'auto', name: 'Auto' });
+  });
+
+  it('deduplicates concurrent startup /api/agent, /api/model, and /api/session into one pre-created shell', async () => {
+    const { url } = await start(
+      { FAKE_ACP_MODELS: '1', FAKE_ACP_MODES: '1', FAKE_ACP_DELAY_SESSION_NEW_MS: '150' },
+      { warmCatalog: false },
+    );
+
+    const [agentResp, modelResp, sessionResp] = await Promise.all([
+      fetch(`${url}/api/agent`),
+      fetch(`${url}/api/model`),
+      fetch(`${url}/api/session`),
+    ]);
+    expect(agentResp.status).toBe(200);
+    expect(modelResp.status).toBe(200);
+    expect(sessionResp.status).toBe(200);
+
+    const agents = (await agentResp.json()) as { data: Array<{ id: string }> };
+    const models = (await modelResp.json()) as { data: Array<{ providerID?: string; id?: string }> };
+    const sessions = (await sessionResp.json()) as { data: Array<{ id: string }> };
+
+    expect(agents.data.map((entry) => entry.id)).toEqual(['default', 'accept-edits', 'auto', 'plan']);
+    expect(models.data.some((m) => m.providerID === 'fake')).toBe(true);
+    expect(sessions.data).toHaveLength(1);
+  });
+
+  it('falls back cleanly to the single primary agent on cold start when the agent exposes no modes', async () => {
+    const { url } = await start({ FAKE_ACP_MODELS: '1' }, { warmCatalog: false });
+
+    for (let i = 0; i < 2; i += 1) {
+      const resp = await fetch(`${url}/api/agent`);
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as { data: Array<{ id: string; mode: string }> };
+      expect(body.data).toHaveLength(1);
+      expect(body.data[0]?.mode).toBe('primary');
+    }
   });
 });

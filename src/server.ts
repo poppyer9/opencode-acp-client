@@ -900,10 +900,13 @@ export class BridgeServer {
       // The composer refuses to submit when `local.agent.current()` is empty,
       // and it does so *silently* (no toast, text stays in the box), which is
       // indistinguishable from "the bridge is broken". When the ACP agent
-      // advertises `category: "mode"` config options, project each mode as an
-      // Agent.Info so `Tab` / `/agents` switches modes; otherwise advertise a
-      // single primary agent that mirrors the ACP session.
+      // advertises `category: "mode"` config options or ACP v1 `modes`, project
+      // each mode as an Agent.Info so `Shift+Tab` / `/agents` switches modes;
+      // otherwise advertise a single primary agent that mirrors the ACP session.
       const focused = this.focusRecord();
+      if (!this.modeOptionFor(focused)) {
+        await this.ensureCatalogSession(focused, asked, 'the agent catalog');
+      }
       located(this.agentCatalog(focused));
       return;
     }
@@ -911,7 +914,11 @@ export class BridgeServer {
       const agentMatch = /^\/api\/agent\/([^/]+)$/.exec(path);
       if (agentMatch && method === 'GET') {
         const wanted = decodeURIComponent(agentMatch[1]!);
-        const found = this.agentCatalog(this.focusRecord()).find((entry) => entry['id'] === wanted);
+        const focused = this.focusRecord();
+        if (!this.modeOptionFor(focused)) {
+          await this.ensureCatalogSession(focused, asked, 'the agent catalog');
+        }
+        const found = this.agentCatalog(focused).find((entry) => entry['id'] === wanted);
         if (!found) {
           json({ error: `agent not found: ${wanted}` }, 404);
           return;
@@ -1029,19 +1036,7 @@ export class BridgeServer {
       // the client makes on a tab switch; see `noteFocus`.
       const focused = this.focusRecord();
       if (this.modelCatalog(focused).models.every((m) => !this.isRealModel(m))) {
-        const needsStart = (candidate: SessionRecord): boolean =>
-          !this.agents.has(candidate.session.id) || this.pendingAgents.has(candidate.session.id);
-        const pending =
-          focused && needsStart(focused)
-            ? focused
-            : this.state.all().find(needsStart);
-        if (pending) {
-          try {
-            await this.ensureAgent(pending);
-          } catch (err) {
-            this.log(`[bridge] could not resolve the model catalog: ${String(err)}`);
-          }
-        }
+        await this.ensureCatalogSession(focused, asked, 'the model catalog');
       }
       const models = this.modelCatalog(focused).models;
       // The catalog is where a real model first becomes knowable, and the client asks for it on
@@ -4343,6 +4338,33 @@ export class BridgeServer {
       if (candidateAgent) ordered.push({ record: candidate, agent: candidateAgent });
     }
     return ordered;
+  }
+
+  /**
+   * Ensure at least one ACP session has started (or join an in-flight startup) so
+   * catalog routes (`/api/agent`, `/api/model`) return real ACP modes/models even on
+   * a cold `--no-tui` bridge before any prompt or `GET /api/session` has arrived.
+   */
+  private async ensureCatalogSession(
+    focused: SessionRecord | undefined,
+    askedDirectory: string | null | undefined,
+    reason: string,
+  ): Promise<void> {
+    const needsStart = (candidate: SessionRecord): boolean =>
+      !this.agents.has(candidate.session.id) || this.pendingAgents.has(candidate.session.id);
+    const requestedDirectory =
+      askedDirectory && existsSync(askedDirectory) ? askedDirectory : undefined;
+    const pending =
+      focused && needsStart(focused)
+        ? focused
+        : this.state.all().find(needsStart) ??
+          (this.state.all().length === 0 ? this.ensureSession(requestedDirectory) : undefined);
+    if (!pending) return;
+    try {
+      await this.ensureAgent(pending);
+    } catch (err) {
+      this.log(`[bridge] could not resolve ${reason}: ${String(err)}`);
+    }
   }
 
   private modeOptionFor(only?: SessionRecord): SessionConfigOption | undefined {
